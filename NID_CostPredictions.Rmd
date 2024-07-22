@@ -1,0 +1,838 @@
+---
+title: "Predicting NID Dam Removal Costs"
+author: "Suman Jumani"
+date: "2023-11-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, cache =TRUE)
+```
+
+
+## **Predicting NID Dam Removal Costs**
+
+Here we  predict dam removal costs for dams within the NID database using a new stochastic gradient boosted model. This model is a revised version of the original cost model (Duda et al. 2023) where the project complexity score is replaced with several proxy metrics that may be directly or indirectly related to complexity induced cost drivers. 
+
+```{r eval=FALSE, echo=FALSE}
+#Load necessary packages
+library(tidyverse)
+library(gbm)
+library(caret)
+library(hrbrthemes)
+library(kableExtra)
+library(patchwork)
+library(skimr)
+library(tune)
+library(pdp)
+library(dplyr)
+library(reshape2)
+library(mice)
+library(ggcorrplot)
+library(ggplot2)
+library(patchwork)
+library(pscl)
+library(quantreg)
+library(tidyr)
+
+rm(list=ls(all=TRUE)) #Clear local memory
+```
+
+#### Step 1 - **Load pre-processed NID data & Predict Costs**
+Load the pre-processed and harmonized NID data, compute missing variables, standardize units, and rename variables where needed.Then compute costs using GBM3 models
+
+```{r}
+#nid<- read.csv("NID_Combined.csv")
+nid<- read.csv("nid_check.csv")
+colnames(nid)
+nid$Height_m <- nid$DamHeight_Ft*0.3048 #Convert ft to meters
+nid$SuperfundAream2 <- nid$SuperfundAreaSqKm*1000000 #Convert to m2
+nid$AvgAnnualQ.CS <- nid$AnnualFlow_cfs*0.028316832 #Convert cfs to cms or cubic meters per sec
+#Soil erodibility factor ranges from 0.02 to 0.64. Soils with higher values are more susceptible to erosion.
+
+library(dplyr)
+nid<- nid%>%
+  mutate(region.xMidwest = if_else(Region.o=="Midwest", 1, 0),
+         region.xNortheast = if_else(Region.o=="Northeast", 1, 0),
+         region.xNorthwest = if_else(Region.o=="Northwest", 1, 0),
+         region.xSoutheast = if_else(Region.o=="Southeast", 1, 0),
+         region.xSouthwest = if_else(Region.o=="Southwest", 1, 0)) #Add one-hot encoded regions
+
+oldnames = c("Latitude", "DrainageArea_Skm", "Height_m","Region.o",
+             "BridgeCount_2.5km", "HistoricBuilding_5km", "Population_5km",
+             "RdCount_2.5km", "ImpervMean", "SoilErodMean", "TRIcount",
+             "DamMateriaCategory", "SuperfundAream2")
+
+newnames = c("latitude.x", "TotDA.SqKm", "dam_height_m","Region",
+             "BridgeCount_2.5km", "HistoricBuilding_5km", "Population_5km",
+             "RdCount_2.5km", "Impervious_MEAN", "SoilErodability_MEAN", "TRICount",
+             "DamMaterialCat", "SuperfundArea_m2")
+nid<- nid %>% rename_at(vars(oldnames), ~ newnames) #Rename to match  model variable names
+colnames(nid)
+nid[,12:16][is.na(nid[,12:16]) == TRUE] <- 0 #Replacing NA with 0 for proximity variables, columns 13:17
+
+#For catchment variables, for rows with some values and some NAs, replace the NA with 0.
+#For rows with all NAs for catchment variables, it's likely we did not delineate a catchment. So retain NAs there
+library(data.table)
+nid2<- data.table(nid)
+colnames(nid2)
+for(i in 1:nrow(nid2)){
+  if(length(unique(is.na(nid2[i,c(17,18,19,20,28)])[1,]))==1) {
+    
+  } else if (length(unique(is.na(nid2[i,c(17,18,19,20,28)])[1,]))==2){
+    nid2[i,c(17,18,19,20,28)][is.na(nid2[i,c(17,18,19,20,28)])] <- 0
+  } 
+  print(i)
+}
+
+nid<-nid2
+nid<- nid%>%
+  mutate(St_PA = if_else(State.x=="Pennsylvania", 1, 0),
+         St_CA = if_else(State.x=="California", 1, 0),
+         St_MI = if_else(State.x=="Michigan", 1, 0),
+         St_MA = if_else(State.x=="Massachusetts", 1, 0),
+         St_WI = if_else(State.x=="Wisconsin", 1, 0))
+
+colnames(nid)
+length(nid$NID.ID[complete.cases(nid[,c(8,12:20,24,25)])])
+
+#Load predictive cost models developed from the previous R script
+gbm3a<- readRDS("LogCost_Global_gbm3a.RDS")
+gbm3a_mean<- readRDS("LogCost_Global_gbm3a_mean.RDS")
+gbm3a_0.5<- readRDS("LogCost_Global_gbm3a_0.5.RDS")
+gbm3a_0.25<-readRDS("LogCost_Global_gbm3a_0.25.RDS") 
+gbm3a_0.75<-readRDS("LogCost_Global_gbm3a_0.75.RDS") 
+gbm3a_0.975<-readRDS("LogCost_Global_gbm3a_0.975.RDS")
+gbm3a_0.025<-readRDS("LogCost_Global_gbm3a_0.025.RDS")
+
+#Predict by exponentiating the results to revert the log transformation
+gbm3a_meanpred = exp(predict(gbm3a_mean, nid))-1
+gbm3a_0.50pred = exp(predict(gbm3a_0.5, nid))-1
+gbm3a_0.75pred = exp(predict(gbm3a_0.75, nid))-1
+gbm3a_0.25pred = exp(predict(gbm3a_0.25, nid))-1
+gbm3a_0.975pred = exp(predict(gbm3a_0.975, nid))-1
+gbm3a_0.025pred = exp(predict(gbm3a_0.025, nid))-1
+
+library(stats)
+colnames(nid)
+#Assigning test data row names to the predictions
+names(gbm3a_meanpred)<- nid$NID.ID[complete.cases(nid[,c(8,12:20,25,29)])]
+names(gbm3a_0.50pred)<- nid$NID.ID[complete.cases(nid[,c(8,12:20,25,29)])]
+names(gbm3a_0.75pred)<- nid$NID.ID[complete.cases(nid[,c(8,12:20,25,29)])]
+names(gbm3a_0.25pred)<- nid$NID.ID[complete.cases(nid[,c(8,12:20,25,29)])]
+names(gbm3a_0.975pred)<-nid$NID.ID[complete.cases(nid[,c(8,12:20,25,29)])]
+names(gbm3a_0.025pred)<-nid$NID.ID[complete.cases(nid[,c(8,12:20,25,29)])]
+
+
+#Compiling the predicted outputs
+comp_nid <- data.frame(NIDID= nid$NID.ID[complete.cases(nid[,c(8,12:20,25,29)])],
+                       Dam.Name= nid$Dam.Name[complete.cases(nid[,c(8,12:20,25,29)])],
+                       latitude= nid$latitude.x[complete.cases(nid[,c(8,12:20,25,29)])],
+                       DamHeight_Ft= nid$DamHeight_Ft[complete.cases(nid[,c(8,12:20,25,29)])],
+                       State= nid$State.x[complete.cases(nid[,c(8,12:20,25,29)])],
+                   
+                   NoLatPredMean = gbm3a_meanpred,
+                   NoLatPredMedian=gbm3a_0.50pred,
+                   NoLatPred_0.75 = gbm3a_0.75pred,
+                   NoLatPred_0.25 = gbm3a_0.25pred,
+                   NoLatPred_0.975 = gbm3a_0.975pred,
+                   NoLatPred_0.025 = gbm3a_0.025pred)
+
+
+#State Adj factors 
+st<- read.csv("USACE_StateAdjustmentFactors.csv")
+PAst<- st$Factor_2020[st$StateCode=="PA"]
+comp_nid$StateCode<- st$Factor_2020[match(comp_nid$State, st$State)]
+
+comp_nid$NoLatPredMean_StAdj<- (comp_nid$NoLatPredMean*comp_nid$StateCode)/PAst
+comp_nid$NoLatPredMedian_StAdj<- (comp_nid$NoLatPredMedian*comp_nid$StateCode)/PAst
+comp_nid$NoLatPred_0.75_StAdj<- (comp_nid$NoLatPred_0.75*comp_nid$StateCode)/PAst
+comp_nid$NoLatPred_0.25_StAdj<- (comp_nid$NoLatPred_0.25*comp_nid$StateCode)/PAst
+comp_nid$NoLatPred_0.975_StAdj<- (comp_nid$NoLatPred_0.975*comp_nid$StateCode)/PAst
+comp_nid$NoLatPred_0.025_StAdj<- (comp_nid$NoLatPred_0.025*comp_nid$StateCode)/PAst
+
+```
+
+
+#### Step 2 - **Forecasting Monetary Investments to Manage Aging at the National Scale**
+Based on the predicted costs of dam removal, we forecast the potential monetary investments in dam removal based on scenarios related to dam age, condition, and hazard for NID dams only at the national scale. 
+We also impute missing dam age using the 'mice' package. This was done by imputing the 'Year completed' variable using three methods - predictive mean matching (PMM), CART regression trees, and random forests - with the variables of latitude, drainage area, dam material category, and height as inputs.
+
+```{r}
+library(dplyr)
+#Append cost data to NID attribute data
+comex_nid_<- left_join(nid, comp_nid, 
+                      by = c("NID.ID" = "NIDID", "Dam.Name" = "Dam.Name"),  
+                      multiple = "first")
+
+#Drop dams with no cost estimate
+comex_nid_rev <- comex_nid_[!is.na(comex_nid_$NoLatPredMean),] #80,714 dams
+
+#Checking for missing age data
+length(comex_nid_rev$YearCompleted[is.na(comex_nid_rev$YearCompleted)]) # 14735 have no year
+
+comex_nid_rev<-comex_nid_rev %>%
+  mutate(across(YearCompleted, ~ na_if(., 0))) #Replace 0 with NA for missing years
+
+# #Imputing missing year data using predictive mean matching & CART methods
+library(mice)
+colnames(comex_nid_rev)
+comex_num<- comex_nid_rev %>%
+  select(latitude.x, TotDA.SqKm, YearCompleted, dam_height_m, DamMaterialCat)
+
+mice_imputed2 <- data.frame(
+  original = comex_num$YearCompleted,
+  imputed_pmm = complete(mice(comex_num, method = "pmm"))$YearCompleted,
+  imputed_cart = complete(mice(comex_num, method = "cart"))$YearCompleted,
+  imputed_rf = complete(mice(comex_num, method = "rf"))$YearCompleted
+)
+
+mice_imputed <- reshape2::melt(mice_imputed2) #Convert to long form
+#Compare all three methods - select the distribution that best matches the original
+ggplot(data=subset(mice_imputed, mice_imputed$value>1800),
+       aes(x=value, colour=variable)) +
+  geom_density() 
+# Based on a visual inspection of the density distribution of the response (original vs original+imputed values), the PPM method of imputation seems best and is selected
+
+#Append PPM imputed costs to compex
+comex_nid_rev<- cbind(comex_nid_rev, mice_imputed2)
+comex_nid_rev<-comex_nid_rev %>%
+  mutate(across(YearCompleted, ~ na_if(., 0))) #Replace 0 with NA for missing years
+comex_nid_rev$YearComp<- coalesce(comex_nid_rev$YearCompleted, comex_nid_rev$imputed_pmm)
+comex_nid_rev$DamAge<- 2023-comex_nid_rev$YearComp #Compute age
+colnames(comex_nid_rev)
+comex_nid_rev<- comex_nid_rev[,-c(56:59)]
+
+#Assign the decade when a dam will reach the 75 year threshold
+comex_nid_rev<-comex_nid_rev %>%
+  dplyr::mutate(
+    Decade_75Yr = case_when(
+      comex_nid_rev$DamAge >= 73 ~ "2025", #A 73 year old dam will be 75 yrs old by 2025
+      comex_nid_rev$DamAge >= 63 ~ "2026-35", #A 63 year old dam will be 75 yrs old by 2035
+      comex_nid_rev$DamAge >= 53 ~ "2036-45",
+      comex_nid_rev$DamAge >= 43 ~ "2046-55",
+      comex_nid_rev$DamAge >= 33 ~ "2056-65",
+      comex_nid_rev$DamAge >= 23 ~ "2066-75",
+      TRUE ~ "Nill")
+  )
+
+#Assign the year when a dam will reach the 75 year threshold
+comex_nid_rev$timeto75 <- 75 - comex_nid_rev$DamAge
+comex_nid_rev$timeto75[comex_nid_rev$timeto75 <0] <- 0
+comex_nid_rev$Year_75Yr <- 2023 + comex_nid_rev$timeto75
+
+```
+
+**### Scenario 1 - Age based thresholds**
+Here, we assess the costs associated with removing **NID dams** greater than or equal to 75 years old across the entire national dataset. Specifically, we will examine the monetary scale of investment needed to remove 20%, 40%, 60%, and 80% of all dams greater than or equal to 75 years old over the next 50 years (i.e. till 2075). To do so, we will sample 20%, 40%, 60%, and 80% of qualified dams 2500 times without replacement and compute test statistics based on the repeated, stratified sample. 
+
+```{r}
+library(dplyr)
+#Examine state-wide costs based on NID dams alone
+
+comex_nid_rev1 <- comex_nid_rev
+comex_nid_rev1$CostByHt<- comex_nid_rev1$NoLatPredMean_StAdj/comex_nid_rev1$dam_height_m
+comex_nid_rev1%>%
+  filter(dam_height_m > 0) %>%
+  summarize(DamCount = n(),
+            TotMeanCost = sum(NoLatPredMean_StAdj), 
+            TotMeanCostPerMt = sum(CostByHt),
+            MeanCostPerMt = mean(CostByHt),
+            SDCostPerMt = sd(CostByHt),
+            CostPerMtPerDam = TotMeanCostPerMt/DamCount
+            )
+
+comex_nid_rev1_St <- comex_nid_rev1%>%
+  filter(dam_height_m > 0) %>%
+  group_by(State.x) %>%
+  summarize(DamCount = n(),
+            TotMeanCost = sum(NoLatPredMean_StAdj), 
+            TotMeanCostPerMt = sum(CostByHt),
+            MeanCostPerMt = mean(CostByHt),
+            SDCostPerMt = sd(CostByHt),
+            CostPerMtPerDam = TotMeanCostPerMt/DamCount
+            )
+  
+library(stars)
+library(ggspatial)
+library(colorspace)
+library(viridis)
+#Load US state shapefile
+us_state <- st_read("tl_2012_us_state.shp")
+us_states<- us_state[! us_state$NAME %in% c("United States Virgin Islands", "American Samoa", "Hawaii",
+                              "Commonwealth of the Northern Mariana Islands","Puerto Rico",
+                              "District of Columbia","Guam", "Alaska"),]
+
+#Append cost calculations to the shapefile
+us_states <- left_join(us_states, comex_nid_rev1_St, by =c("NAME"="State.x")) 
+us_states_Label <- us_states[! us_states$STUSPS %in% c("MD", "DE", "NJ", "NH", 
+                                                       "CT", "RI", "MA", "VT"),]
+
+StCost<- ggplot(us_states) +
+    geom_sf(aes(fill = (MeanCostPerMt/1000000))) +
+    geom_sf_text(data = us_states_Label, aes(label = STUSPS), size=2.5, check_overlap = TRUE)+
+    theme_minimal()+
+    scale_fill_distiller(palette = "BrBG",limits = c(0.05,0.4), 
+                                     breaks = c(0.05, 0.15, 0.25, 0.35),
+    guide = guide_colourbar(nbin = 100, draw.ulim = FALSE, draw.llim = FALSE))+
+    labs(fill='Mean cost per  \nmeter dam height  \n(Millions of USD)  \n   ')+
+    theme(legend.position = "bottom"); StCost
+
+DP<- ggplot(comex_nid_rev1_St, aes(x=MeanCostPerMt))+
+  geom_density()+ xlim(50000,400000)+
+  xlab("") + ylab("Density")+
+  geom_vline(aes(xintercept=mean(MeanCostPerMt)), 
+             color="blue", linetype="dashed", size=1)+
+  theme_classic(); DP
+
+# --------------------------------------------------------------------------------
+# Loop to compute costs for removing 25%,50%,75% of dams >= 75 years old per decade
+# --------------------------------------------------------------------------------
+decades <- unique(comex_nid_rev$Decade_75Yr) #Unique time steps
+scenario1_nid <- data.frame(NULL)
+
+for(i in 1:length(decades)) {
+  tmpcomp <- comex_nid_rev[comex_nid_rev$Decade_75Yr %in% decades[i],]  #For each timestep
+  tmpsamp20mean <- colSums(replicate(2500,sample(tmpcomp$NoLatPredMean_StAdj,
+                        size=0.20*nrow(tmpcomp), replace = F)))  
+  tmpsamp20lci <- colSums(replicate(2500,sample(tmpcomp$NoLatPred_0.25_StAdj,
+                        size=0.20*nrow(tmpcomp), replace = F)))  
+  tmpsamp20uci <- colSums(replicate(2500,sample(tmpcomp$NoLatPred_0.75_StAdj,
+                        size=0.20*nrow(tmpcomp), replace = F)))  #Sample 20% without replacement 1000 times & compute total cost for each sample
+  tmpsamp40mean <- colSums(replicate(2500,sample(tmpcomp$NoLatPredMean_StAdj,
+                        size=0.40*nrow(tmpcomp), replace = F)))
+  tmpsamp40lci <- colSums(replicate(2500,sample(tmpcomp$NoLatPred_0.25_StAdj,
+                        size=0.40*nrow(tmpcomp), replace = F)))
+  tmpsamp40uci <- colSums(replicate(2500,sample(tmpcomp$NoLatPred_0.75_StAdj,
+                        size=0.40*nrow(tmpcomp), replace = F)))#Sample 40% without replacement 1000 times & compute total cost for each sample
+  tmpsamp60mean <- colSums(replicate(2500,sample(tmpcomp$NoLatPredMean_StAdj,
+                        size=0.60*nrow(tmpcomp), replace = F)))
+  tmpsamp60lci <- colSums(replicate(2500,sample(tmpcomp$NoLatPred_0.25_StAdj,
+                        size=0.60*nrow(tmpcomp), replace = F)))
+  tmpsamp60uci <- colSums(replicate(2500,sample(tmpcomp$NoLatPred_0.75_StAdj,
+                        size=0.60*nrow(tmpcomp), replace = F)))#Sample 60% without replacement 1000 times & compute total cost for each sample
+  tmpsamp80mean <- colSums(replicate(2500,sample(tmpcomp$NoLatPredMean_StAdj,
+                        size=0.80*nrow(tmpcomp), replace = F)))
+  tmpsamp80lci <- colSums(replicate(2500,sample(tmpcomp$NoLatPred_0.25_StAdj,
+                        size=0.80*nrow(tmpcomp), replace = F)))
+  tmpsamp80uci <- colSums(replicate(2500,sample(tmpcomp$NoLatPred_0.75_StAdj,
+                        size=0.80*nrow(tmpcomp), replace = F)))#Sample 80% without replacement 1000 times & compute total cost for each sample
+  scenario1_nid <- rbind(scenario1_nid,
+                     data.frame(decade=rep(decades[i],4),
+                                prop.removed=c("20%","40%","60%","80%"),
+                                totdams = (c(0.2,0.4,0.6, 0.8)*nrow(tmpcomp)),
+                                totcost.mean=c(mean(tmpsamp20mean),mean(tmpsamp40mean),
+                                               mean(tmpsamp60mean),mean(tmpsamp80mean)),
+                                
+                                totcost.mean.sd=c(sd(tmpsamp20mean),sd(tmpsamp40mean),
+                                             sd(tmpsamp60mean),sd(tmpsamp80mean)),
+                                
+                                totcost.mean.min=c(min(tmpsamp20mean),min(tmpsamp40mean),
+                                              min(tmpsamp60mean),min(tmpsamp80mean)),
+
+                                totcost.mean.max=c(max(tmpsamp20mean),max(tmpsamp40mean),
+                                              max(tmpsamp60mean),max(tmpsamp80mean)),
+                                
+                                
+                                totcost.uci=c(mean(tmpsamp20uci),mean(tmpsamp40uci),
+                                               mean(tmpsamp60uci),mean(tmpsamp80uci)),
+                                
+                                totcost.uci.sd=c(sd(tmpsamp20uci),sd(tmpsamp40uci),
+                                             sd(tmpsamp60uci),sd(tmpsamp80uci)),
+                                
+                                totcost.uci.min=c(min(tmpsamp20uci),min(tmpsamp40uci),
+                                              min(tmpsamp60uci),min(tmpsamp80uci)),
+
+                                totcost.uci.max=c(max(tmpsamp20uci),max(tmpsamp40uci),
+                                              max(tmpsamp60uci),max(tmpsamp80uci)),
+                                
+                                
+                                totcost.lci=c(mean(tmpsamp20lci),mean(tmpsamp40lci),
+                                               mean(tmpsamp60lci),mean(tmpsamp80lci)),
+
+                                totcost.lci.sd=c(sd(tmpsamp20lci),sd(tmpsamp40lci),
+                                             sd(tmpsamp60lci),sd(tmpsamp80lci)),
+
+                                # totcost.mean.quant25=c(quantile(tmpsamp20mean, 0.25),
+                                #                   quantile(tmpsamp40mean, 0.25),
+                                #                   quantile(tmpsamp60mean, 0.25),
+                                #                   quantile(tmpsamp80mean, 0.25)),
+                                # 
+                                # totcost.mean.quant75=c(quantile(tmpsamp20mean, 0.75),
+                                #                   quantile(tmpsamp40mean, 0.75),
+                                #                   quantile(tmpsamp60mean, 0.75),
+                                #                   quantile(tmpsamp80mean, 0.75)),
+
+                                totcost.lci.min=c(min(tmpsamp20lci),min(tmpsamp40lci),
+                                              min(tmpsamp60lci),min(tmpsamp80lci)),
+
+                                totcost.lci.max=c(max(tmpsamp20lci),max(tmpsamp40lci),
+                                              max(tmpsamp60lci),max(tmpsamp80lci))
+                                ))
+}
+
+#Cost to remove 100% of dams >=75 years old
+sc1_100pcnt <-comex_nid_rev %>%
+  rename("decade" = "Decade_75Yr")%>%
+  group_by(decade) %>%
+  summarize(prop.removed = "100%",
+            totdams = n(),
+            totcost.mean = sum(NoLatPredMean_StAdj),
+            totcost.mean.sd = NA,
+            #totcost.quant25 = NA,
+            #totcost.quant75 = NA,
+            totcost.mean.min= NA,
+            totcost.mean.max= NA, 
+            
+            totcost.uci = sum(NoLatPred_0.75_StAdj),
+            totcost.uci.sd= NA,
+            totcost.uci.min= NA,
+            totcost.uci.max = NA, 
+              
+            totcost.lci = sum(NoLatPred_0.25_StAdj),
+            totcost.lci.sd= NA,
+            totcost.lci.min= NA,
+            totcost.lci.max = NA)
+
+# #Combine it together
+scenario1_nid<- rbind(scenario1_nid,sc1_100pcnt)
+scenario1_nid %>%
+  filter(decade != "Nill")%>%
+  group_by(prop.removed) %>%
+  summarize(Cost = sum(totcost.mean))
+
+#Visualizing the output
+library(ggplot2)
+scenario1_nid$prop.removed <- factor(scenario1_nid$prop.removed, levels = c('100%','80%','60%','40%','20%'))
+scenario1_nid$totcost.mean.min
+S1_nid <-ggplot(data=subset(scenario1_nid, scenario1_nid$decade != "Nill"), 
+              aes(x=decade, y=(totcost.mean/1000000000), 
+                  ymin=(totcost.mean.min/1000000000), ymax=(totcost.mean.max/1000000000), 
+                  fill=prop.removed, alpha=0.9)) +
+  geom_bar(position=position_dodge(), alpha=0.65, stat="identity")+
+  geom_errorbar(width=.2, position=position_dodge(0.9))+
+  geom_text(aes(label = round(totdams)), hjust=0.4,vjust = -1.5,
+            position=position_dodge2(0.9), colour="black", size =2.5)+
+  scale_x_discrete(labels = c('Exceeded 75 \n years in 2025','2026-35','2036-45',
+                              '2046-55','2056-65','2066-75'))+
+  ylim(0,35) +xlab('')+ scale_alpha(guide = 'none')+ 
+  ylab('Cost of Dam Removals \n (in Billions of 2020 USD)')+
+  scale_fill_manual(name = "Proportion removed",values=c("#1C1C1C", "deepskyblue4","darkslategrey", "lightseagreen", "darkseagreen"))+
+ theme_minimal()+ theme(legend.position="bottom"); S1_nid
+
+
+scenario1_nid_long <- melt(setDT(scenario1_nid), 
+                           id.vars = c("decade","prop.removed", "totdams" ),
+                           variable.name = "CostType")
+
+scenario1_nid_long$Type <- fct_recode(scenario1_nid_long$CostType,
+                           'Mean' = 'totcost.mean','Mean' = 'totcost.mean.sd',
+                           'Mean' = 'totcost.mean.min','Mean' = 'totcost.mean.max',
+                           'Upper50%PI'='totcost.uci',  'Upper50%PI' ='totcost.uci.sd',
+                           'Upper50%PI' ='totcost.uci.min','Upper50%PI' ='totcost.uci.max',
+                           'Lower50%PI' = 'totcost.lci', 'Lower50%PI' = 'totcost.lci.sd',
+                           'Lower50%PI' = 'totcost.lci.min', 'Lower50%PI' = 'totcost.lci.max')
+
+scenario1_nid_long$Catgory<- fct_recode(scenario1_nid_long$CostType, 
+                          'TotCost' = 'totcost.mean',
+                          'TotCost' = 'totcost.uci',
+                          'TotCost' = 'totcost.lci', 
+                          
+                          'MinCost' = 'totcost.mean.min',
+                          'MinCost' = 'totcost.uci.min',
+                          'MinCost' = 'totcost.lci.min', 
+                          
+                          'MaxCost' = 'totcost.mean.max',
+                          'MaxCost' = 'totcost.lci.max',
+                          'MaxCost' = 'totcost.uci.max', 
+                          
+                          'SDcost' = 'totcost.mean.sd',
+                          'SDcost' = 'totcost.uci.sd',
+                          'SDcost' = 'totcost.lci.sd'
+                                     )
+
+scenario1_nid_long$prop.removed <- factor(scenario1_nid_long$prop.removed, levels = c('100%','80%','60%','40%','20%'))
+scenario1_nid_long$Type <- factor(scenario1_nid_long$Type, levels = c('Lower50%PI','Mean','Upper50%PI'))
+
+S1_nid_wide <- scenario1_nid_long[,-4] %>%
+  pivot_wider(everything(),
+              names_from = "Catgory",
+              values_from = "value") %>%
+  data.frame()
+
+S1_nid_WithPI <-ggplot(data=subset(S1_nid_wide, S1_nid_wide$decade != "Nill"),
+       aes(x = prop.removed, y = (TotCost/1000000000), fill = Type))+
+  geom_bar(position="identity", alpha=0.4, stat="identity")+
+  #geom_errorbar(width=.2, color="gray18")+
+  facet_grid(~ decade, switch = "x") +
+  theme(strip.placement = "outside",
+        strip.background = element_rect(fill = NA, color = "white"),
+        panel.spacing = unit(.12,"cm"))+
+  scale_fill_manual(name = "Cost",values=c("#1C1C1C", "deepskyblue4","darkslategrey"))+
+  geom_text(data=S1_nid_wide[S1_nid_wide$Type %in% 'Upper50%PI' &
+                               S1_nid_wide$decade != "Nill",], 
+            aes(label = round(totdams)), hjust=0.43,vjust = -1.5,
+           position=position_dodge2(0.9), colour="black", size =2.5)+
+  ylim(0,90)+xlab('')+ ylab('Cost of Dam Removals \n (in Billions of 2020 USD)')+
+  theme_minimal()+ theme(legend.position="bottom")+
+  theme(axis.text.x = element_text(angle=90, vjust=.5, hjust=1)); S1_nid_WithPI
+
+```
+
+**### Scenario 2 - Condition & Hazard based thresholds**
+Here, we assess the costs associated with removing NID dams having  -   
++  Poor condition (Poor, Unsatisfactory, Breached, Failed)  
++  Combination of poor condition & age >= 50 years
++  Combination of poor condition & high hazard potential (high, significant)  
++  Combination of poor condition, high hazard potential, & age >= 50 years  
+
+```{r}
+#Retain the following condition categories - Poor, Unsatisfactory
+#Exclude Fair, Satisfactory, and Unknown categories
+library(dplyr)
+library(ggplot2)
+colnames(comex_nid_rev)
+table(comex_nid_rev$FinalConditionClass)
+table(comex_nid_rev$FinalHazardClass)
+
+table(comex_cond_nid$FinalConditionClass)
+
+comex_cond_nid <- comex_nid_rev %>%  filter(! FinalConditionClass %in% c("Fair", "Satisfactory", "Unknown", "Not Available", "Not Rated", "")) #7475 dams
+comex_condage_nid <- comex_cond_nid %>%  filter(DamAge >= 50) #6076 dams
+
+comex_condhaz_nid <- comex_cond_nid %>%  filter(! FinalHazardClass %in% c("Low", "Undetermined")) #3621 dams
+comex_condhazage_nid <- comex_condhaz_nid %>%  filter(DamAge >= 50) #3023 dams
+  
+#Condition only - Sample x% without replacement 2500 times & compute total cost
+samp20c <- colSums(replicate(2500,sample(comex_cond_nid$NoLatPredMean_StAdj,
+                  size=0.20*nrow(comex_cond_nid), replace = F)))
+samp40c <- colSums(replicate(2500,sample(comex_cond_nid$NoLatPredMean_StAdj,
+                  size=0.40*nrow(comex_cond_nid), replace = F)))
+samp60c <- colSums(replicate(2500,sample(comex_cond_nid$NoLatPredMean_StAdj,
+                  size=0.60*nrow(comex_cond_nid), replace = F)))
+samp80c <- colSums(replicate(2500,sample(comex_cond_nid$NoLatPredMean_StAdj,
+                  size=0.80*nrow(comex_cond_nid), replace = F)))
+
+samp20c_uci <- colSums(replicate(2500,sample(comex_cond_nid$NoLatPred_0.75_StAdj,
+                  size=0.20*nrow(comex_cond_nid), replace = F)))
+samp40c_uci <- colSums(replicate(2500,sample(comex_cond_nid$NoLatPred_0.75_StAdj,
+                  size=0.40*nrow(comex_cond_nid), replace = F)))
+samp60c_uci <- colSums(replicate(2500,sample(comex_cond_nid$NoLatPred_0.75_StAdj,
+                  size=0.60*nrow(comex_cond_nid), replace = F)))
+samp80c_uci <- colSums(replicate(2500,sample(comex_cond_nid$NoLatPred_0.75_StAdj,
+                  size=0.80*nrow(comex_cond_nid), replace = F)))
+
+samp20c_lci <- colSums(replicate(2500,sample(comex_cond_nid$NoLatPred_0.25_StAdj,
+                  size=0.20*nrow(comex_cond_nid), replace = F)))
+samp40c_lci <- colSums(replicate(2500,sample(comex_cond_nid$NoLatPred_0.25_StAdj,
+                  size=0.40*nrow(comex_cond_nid), replace = F)))
+samp60c_lci <- colSums(replicate(2500,sample(comex_cond_nid$NoLatPred_0.25_StAdj,
+                  size=0.60*nrow(comex_cond_nid), replace = F)))
+samp80c_lci <- colSums(replicate(2500,sample(comex_cond_nid$NoLatPred_0.25_StAdj,
+                  size=0.80*nrow(comex_cond_nid), replace = F)))
+
+#Condition & Age - Sample x% without replacement 2500 times & compute total cost
+samp20ca <- colSums(replicate(2500,sample(comex_condage_nid$NoLatPredMean_StAdj,
+                  size=0.20*nrow(comex_condage_nid), replace = F)))
+samp40ca <- colSums(replicate(2500,sample(comex_condage_nid$NoLatPredMean_StAdj,
+                  size=0.40*nrow(comex_condage_nid), replace = F)))
+samp60ca <- colSums(replicate(2500,sample(comex_condage_nid$NoLatPredMean_StAdj,
+                  size=0.60*nrow(comex_condage_nid), replace = F)))
+samp80ca <- colSums(replicate(2500,sample(comex_condage_nid$NoLatPredMean_StAdj,
+                  size=0.80*nrow(comex_condage_nid), replace = F)))
+
+samp20ca_uci <- colSums(replicate(2500,sample(comex_condage_nid$NoLatPred_0.75_StAdj,
+                  size=0.20*nrow(comex_condage_nid), replace = F)))
+samp40ca_uci <- colSums(replicate(2500,sample(comex_condage_nid$NoLatPred_0.75_StAdj,
+                  size=0.40*nrow(comex_condage_nid), replace = F)))
+samp60ca_uci <- colSums(replicate(2500,sample(comex_condage_nid$NoLatPred_0.75_StAdj,
+                  size=0.60*nrow(comex_condage_nid), replace = F)))
+samp80ca_uci <- colSums(replicate(2500,sample(comex_condage_nid$NoLatPred_0.75_StAdj,
+                  size=0.80*nrow(comex_condage_nid), replace = F)))
+
+samp20ca_lci <- colSums(replicate(2500,sample(comex_condage_nid$NoLatPred_0.25_StAdj,
+                  size=0.20*nrow(comex_condage_nid), replace = F)))
+samp40ca_lci <- colSums(replicate(2500,sample(comex_condage_nid$NoLatPred_0.25_StAdj,
+                  size=0.40*nrow(comex_condage_nid), replace = F)))
+samp60ca_lci <- colSums(replicate(2500,sample(comex_condage_nid$NoLatPred_0.25_StAdj,
+                  size=0.60*nrow(comex_condage_nid), replace = F)))
+samp80ca_lci <- colSums(replicate(2500,sample(comex_condage_nid$NoLatPred_0.25_StAdj,
+                  size=0.80*nrow(comex_condage_nid), replace = F)))
+
+#Condition & Hazard - Sample x% without replacement 2500 times & compute total cost
+samp20ch <- colSums(replicate(2500,sample(comex_condhaz_nid$NoLatPredMean_StAdj,
+                  size=0.20*nrow(comex_condhaz_nid), replace = F)))
+samp40ch <- colSums(replicate(2500,sample(comex_condhaz_nid$NoLatPredMean_StAdj,
+                  size=0.40*nrow(comex_condhaz_nid), replace = F)))
+samp60ch <- colSums(replicate(2500,sample(comex_condhaz_nid$NoLatPredMean_StAdj,
+                  size=0.60*nrow(comex_condhaz_nid), replace = F)))
+samp80ch <- colSums(replicate(2500,sample(comex_condhaz_nid$NoLatPredMean_StAdj,
+                  size=0.80*nrow(comex_condhaz_nid), replace = F)))
+
+samp20ch_uci <- colSums(replicate(2500,sample(comex_condhaz_nid$NoLatPred_0.75_StAdj,
+                  size=0.20*nrow(comex_condhaz_nid), replace = F)))
+samp40ch_uci <- colSums(replicate(2500,sample(comex_condhaz_nid$NoLatPred_0.75_StAdj,
+                  size=0.40*nrow(comex_condhaz_nid), replace = F)))
+samp60ch_uci <- colSums(replicate(2500,sample(comex_condhaz_nid$NoLatPred_0.75_StAdj,
+                  size=0.60*nrow(comex_condhaz_nid), replace = F)))
+samp80ch_uci <- colSums(replicate(2500,sample(comex_condhaz_nid$NoLatPred_0.75_StAdj,
+                  size=0.80*nrow(comex_condhaz_nid), replace = F)))
+
+samp20ch_lci <- colSums(replicate(2500,sample(comex_condhaz_nid$NoLatPred_0.25_StAdj,
+                  size=0.20*nrow(comex_condhaz_nid), replace = F)))
+samp40ch_lci <- colSums(replicate(2500,sample(comex_condhaz_nid$NoLatPred_0.25_StAdj,
+                  size=0.40*nrow(comex_condhaz_nid), replace = F)))
+samp60ch_lci <- colSums(replicate(2500,sample(comex_condhaz_nid$NoLatPred_0.25_StAdj,
+                  size=0.60*nrow(comex_condhaz_nid), replace = F)))
+samp80ch_lci <- colSums(replicate(2500,sample(comex_condhaz_nid$NoLatPred_0.25_StAdj,
+                  size=0.80*nrow(comex_condhaz_nid), replace = F)))
+
+#Condition, Hazard, Age - Sample x% without replacement 2500 times & compute total cost
+samp20cha <- colSums(replicate(2500,sample(comex_condhazage_nid$NoLatPredMean_StAdj,
+                  size=0.20*nrow(comex_condhazage_nid), replace = F)))
+samp40cha <- colSums(replicate(2500,sample(comex_condhazage_nid$NoLatPredMean_StAdj,
+                  size=0.40*nrow(comex_condhazage_nid), replace = F)))
+samp60cha <- colSums(replicate(2500,sample(comex_condhazage_nid$NoLatPredMean_StAdj,
+                  size=0.60*nrow(comex_condhazage_nid), replace = F)))
+samp80cha <- colSums(replicate(2500,sample(comex_condhazage_nid$NoLatPredMean_StAdj,
+                  size=0.80*nrow(comex_condhazage_nid), replace = F)))
+
+samp20cha_uci <- colSums(replicate(2500,sample(comex_condhazage_nid$NoLatPred_0.75_StAdj,
+                  size=0.20*nrow(comex_condhazage_nid), replace = F)))
+samp40cha_uci <- colSums(replicate(2500,sample(comex_condhazage_nid$NoLatPred_0.75_StAdj,
+                  size=0.40*nrow(comex_condhazage_nid), replace = F)))
+samp60cha_uci <- colSums(replicate(2500,sample(comex_condhazage_nid$NoLatPred_0.75_StAdj,
+                  size=0.60*nrow(comex_condhazage_nid), replace = F)))
+samp80cha_uci <- colSums(replicate(2500,sample(comex_condhazage_nid$NoLatPred_0.75_StAdj,
+                  size=0.80*nrow(comex_condhazage_nid), replace = F)))
+
+samp20cha_lci <- colSums(replicate(2500,sample(comex_condhazage_nid$NoLatPred_0.25_StAdj,
+                  size=0.20*nrow(comex_condhazage_nid), replace = F)))
+samp40cha_lci <- colSums(replicate(2500,sample(comex_condhazage_nid$NoLatPred_0.25_StAdj,
+                  size=0.40*nrow(comex_condhazage_nid), replace = F)))
+samp60cha_lci <- colSums(replicate(2500,sample(comex_condhazage_nid$NoLatPred_0.25_StAdj,
+                  size=0.60*nrow(comex_condhazage_nid), replace = F)))
+samp80cha_lci <- colSums(replicate(2500,sample(comex_condhazage_nid$NoLatPred_0.25_StAdj,
+                  size=0.80*nrow(comex_condhazage_nid), replace = F)))
+#------------------------------------------------------------------------------
+scenario2_cond <- data.frame(prop.removed=c("20%","40%","60%","80%"),
+                         totdams = (c(0.2,0.4,0.6, 0.8)*nrow(comex_cond_nid)),
+                         totcost.mean=c(mean(samp20c),mean(samp40c),
+                                        mean(samp60c),mean(samp80c)),
+
+                         totcost.mean.sd=c(sd(samp20c),sd(samp40c),
+                                      sd(samp60c),sd(samp80c)),
+
+                         totcost.mean.min=c(min(samp20c),min(samp40c),
+                                        min(samp60c),min(samp80c)),
+
+                          totcost.mean.max=c(max(samp20c),max(samp40c),
+                                        max(samp60c),max(samp80c)), 
+                         
+                          totcost.uci=c(mean(samp20c_uci),mean(samp40c_uci),
+                                        mean(samp60c_uci),mean(samp80c_uci)),
+                          totcost.uci.sd=c(sd(samp20c_uci),sd(samp40c_uci),
+                                           sd(samp60c_uci),sd(samp80c_uci)),
+                          totcost.uci.min=c(min(samp20c_uci),min(samp40c_uci),
+                                            min(samp60c_uci),min(samp80c_uci)),
+                          totcost.uci.max=c(max(samp20c_uci),max(samp40c_uci),
+                                            max(samp60c_uci),max(samp80c_uci)), 
+                         
+                         totcost.lci=c(mean(samp20c_lci),mean(samp40c_lci),
+                                       mean(samp60c_lci),mean(samp80c_lci)),
+                         totcost.lci.sd=c(sd(samp20c_lci),sd(samp40c_lci),
+                                          sd(samp60c_lci),sd(samp80c_lci)),
+                         totcost.lci.min=c(min(samp20c_lci),min(samp40c_lci),
+                                           min(samp60c_lci),min(samp80c_lci)),
+                         totcost.lci.max=c(max(samp20c_lci),max(samp40c_lci),
+                                           max(samp60c_lci),max(samp80c_lci)))
+
+sc2_100pcnt_cond <-comex_cond_nid %>%
+  summarize(prop.removed = "100%", totdams = n(),
+            totcost.mean = sum(NoLatPredMean_StAdj), totcost.mean.sd = NA,
+            #totcost.quant25 = NA, totcost.quant75 = NA,
+            totcost.mean.min= NA, totcost.mean.max= NA, 
+            totcost.uci = sum(NoLatPred_0.75_StAdj), totcost.uci.sd=NA,
+            totcost.uci.min= NA, totcost.uci.max = NA, 
+            totcost.lci = sum(NoLatPred_0.25_StAdj), totcost.lci.sd=NA,
+            totcost.lci.min= NA, totcost.lci.max = NA)
+scenario2_cond<- rbind(scenario2_cond,sc2_100pcnt_cond)
+scenario2_cond$threshold<-"ConditionOnly"
+
+#-------------------------------------------------------------------------------
+
+scenario2_condage <- data.frame(prop.removed=c("20%","40%","60%","80%"),
+                         totdams = (c(0.2,0.4,0.6, 0.8)*nrow(comex_condage_nid)),
+                         
+                         totcost.mean=c(mean(samp20ca),mean(samp40ca),
+                                        mean(samp60ca),mean(samp80ca)),
+                         totcost.mean.sd=c(sd(samp20ca),sd(samp40ca),
+                                      sd(samp60ca),sd(samp80ca)),
+                         totcost.mean.min=c(min(samp20ca),min(samp40ca),
+                                        min(samp60ca),min(samp80ca)),
+                         totcost.mean.max=c(max(samp20ca),max(samp40ca),
+                                        max(samp60ca),max(samp80ca)), 
+                         
+                         totcost.uci=c(mean(samp20ca_uci),mean(samp40ca_uci),
+                                        mean(samp60ca_uci),mean(samp80ca_uci)),
+                          totcost.uci.sd=c(sd(samp20ca_uci),sd(samp40ca_uci),
+                                           sd(samp60ca_uci),sd(samp80ca_uci)),
+                          totcost.uci.min=c(min(samp20ca_uci),min(samp40ca_uci),
+                                            min(samp60ca_uci),min(samp80ca_uci)),
+                          totcost.uci.max=c(max(samp20ca_uci),max(samp40ca_uci),
+                                            max(samp60ca_uci),max(samp80ca_uci)), 
+                         
+                         totcost.lci=c(mean(samp20ca_lci),mean(samp40ca_lci),
+                                       mean(samp60ca_lci),mean(samp80ca_lci)),
+                         totcost.lci.sd=c(sd(samp20ca_lci),sd(samp40ca_lci),
+                                          sd(samp60ca_lci),sd(samp80ca_lci)),
+                         totcost.lci.min=c(min(samp20ca_lci),min(samp40ca_lci),
+                                           min(samp60ca_lci),min(samp80ca_lci)),
+                         totcost.lci.max=c(max(samp20ca_lci),max(samp40ca_lci),
+                                           max(samp60ca_lci),max(samp80ca_lci)))
+
+sc2_100pcnt_condage <-comex_condage_nid %>%
+  summarize(prop.removed = "100%", totdams = n(),
+            totcost.mean = sum(NoLatPredMean_StAdj), totcost.mean.sd = NA,
+            #totcost.quant25 = NA, totcost.quant75 = NA,
+            totcost.mean.min= NA, totcost.mean.max= NA,
+            totcost.uci = sum(NoLatPred_0.75_StAdj), totcost.uci.sd=NA,
+            totcost.uci.min= NA, totcost.uci.max = NA, 
+            totcost.lci = sum(NoLatPred_0.25_StAdj), totcost.lci.sd=NA,
+            totcost.lci.min= NA, totcost.lci.max = NA)
+scenario2_condage<- rbind(scenario2_condage,sc2_100pcnt_condage)
+scenario2_condage$threshold<-"Condition&Age"
+
+#-------------------------------------------------------------------------
+scenario2condhaz <- data.frame(prop.removed=c("20%","40%","60%","80%"),
+                         totdams = (c(0.2,0.4,0.6, 0.8)*nrow(comex_condhaz_nid)),
+                         totcost.mean=c(mean(samp20ch),mean(samp40ch),
+                                        mean(samp60ch),mean(samp80ch)),
+                         totcost.mean.sd=c(sd(samp20ch),sd(samp40ch),
+                                      sd(samp60ch),sd(samp80ch)),
+                         totcost.mean.min=c(min(samp20ch),min(samp40ch),
+                                        min(samp60ch),min(samp80ch)),
+                         totcost.mean.max=c(max(samp20ch),max(samp40ch),
+                                        max(samp60ch),max(samp80ch)),
+                         
+                         totcost.uci=c(mean(samp20ch_uci),mean(samp40ch_uci),
+                                        mean(samp60ch_uci),mean(samp80ch_uci)),
+                         totcost.uci.sd=c(sd(samp20ch_uci),sd(samp40ch_uci),
+                                           sd(samp60ch_uci),sd(samp80ch_uci)),
+                         totcost.uci.min=c(min(samp20ch_uci),min(samp40ch_uci),
+                                            min(samp60ch_uci),min(samp80ch_uci)),
+                         totcost.uci.max=c(max(samp20ch_uci),max(samp40ch_uci),
+                                            max(samp60ch_uci),max(samp80ch_uci)), 
+                         
+                         totcost.lci=c(mean(samp20ch_lci),mean(samp40ch_lci),
+                                       mean(samp60ch_lci),mean(samp80ch_lci)),
+                         totcost.lci.sd=c(sd(samp20ch_lci),sd(samp40ch_lci),
+                                          sd(samp60ch_lci),sd(samp80ch_lci)),
+                         totcost.lci.min=c(min(samp20ch_lci),min(samp40ch_lci),
+                                           min(samp60ch_lci),min(samp80ch_lci)),
+                         totcost.lci.max=c(max(samp20ch_lci),max(samp40ch_lci),
+                                           max(samp60ch_lci),max(samp80ch_lci)))
+sc2_100pcnt_ch <-comex_condhaz_nid %>%
+  summarize(prop.removed = "100%", totdams = n(),
+            totcost.mean = sum(NoLatPredMean_StAdj), totcost.mean.sd = NA,
+            #totcost.quant25 = NA, totcost.quant75 = NA,
+            totcost.mean.min= NA, totcost.mean.max= NA,
+            totcost.uci = sum(NoLatPred_0.75_StAdj), totcost.uci.sd=NA,
+            totcost.uci.min= NA, totcost.uci.max = NA, 
+            totcost.lci = sum(NoLatPred_0.25_StAdj), totcost.lci.sd=NA,
+            totcost.lci.min= NA, totcost.lci.max = NA)
+scenario2condhaz<- rbind(scenario2condhaz,sc2_100pcnt_ch)
+scenario2condhaz$threshold<-"Condition&Hazard"
+
+#-------------------------------------------------------------------------
+scenario2condhazage <- data.frame(prop.removed=c("20%","40%","60%","80%"),
+                         totdams = (c(0.2,0.4,0.6, 0.8)*nrow(comex_condhazage_nid)),
+                         
+                         totcost.mean=c(mean(samp20cha),mean(samp40cha),
+                                        mean(samp60cha),mean(samp80cha)),
+                         totcost.mean.sd=c(sd(samp20cha),sd(samp40cha),
+                                      sd(samp60cha),sd(samp80cha)),
+                         totcost.mean.min=c(min(samp20cha),min(samp40cha),
+                                        min(samp60cha),min(samp80cha)),
+                         totcost.mean.max=c(max(samp20cha),max(samp40cha),
+                                        max(samp60cha),max(samp80cha)),
+                         
+                         totcost.uci=c(mean(samp20cha_uci),mean(samp40cha_uci),
+                                        mean(samp60cha_uci),mean(samp80cha_uci)),
+                         totcost.uci.sd=c(sd(samp20cha_uci),sd(samp40cha_uci),
+                                           sd(samp60cha_uci),sd(samp80cha_uci)),
+                         totcost.uci.min=c(min(samp20cha_uci),min(samp40cha_uci),
+                                            min(samp60cha_uci),min(samp80cha_uci)),
+                         totcost.uci.max=c(max(samp20cha_uci),max(samp40cha_uci),
+                                            max(samp60cha_uci),max(samp80cha_uci)), 
+                         
+                         totcost.lci=c(mean(samp20cha_lci),mean(samp40cha_lci),
+                                       mean(samp60cha_lci),mean(samp80cha_lci)),
+                         totcost.lci.sd=c(sd(samp20cha_lci),sd(samp40cha_lci),
+                                          sd(samp60cha_lci),sd(samp80cha_lci)),
+                         totcost.lci.min=c(min(samp20cha_lci),min(samp40cha_lci),
+                                           min(samp60cha_lci),min(samp80cha_lci)),
+                         totcost.lci.max=c(max(samp20cha_lci),max(samp40cha_lci),
+                                           max(samp60cha_lci),max(samp80cha_lci)))
+sc2_100pcnt_cha <-comex_condhazage_nid %>%
+  summarize(prop.removed = "100%", totdams = n(),
+            totcost.mean = sum(NoLatPredMean_StAdj), totcost.mean.sd = NA,
+            #totcost.quant25 = NA, totcost.quant75 = NA,
+            totcost.mean.min= NA, totcost.mean.max= NA,
+            totcost.uci = sum(NoLatPred_0.75_StAdj), totcost.uci.sd=NA,
+            totcost.uci.min= NA, totcost.uci.max = NA, 
+            totcost.lci = sum(NoLatPred_0.25_StAdj), totcost.lci.sd=NA,
+            totcost.lci.min= NA, totcost.lci.max = NA)
+scenario2condhazage<- rbind(scenario2condhazage,sc2_100pcnt_cha)
+scenario2condhazage$threshold<-"ConditionHazard&Age"
+#--------------------------------------------------------------------------------
+
+#Combine it together
+scenario2_nid<- (rbind(scenario2_cond,scenario2_condage, scenario2condhaz, scenario2condhazage))
+
+#Visualizing the output
+scenario2_nid$prop.removed <- factor(scenario2_nid$prop.removed, levels = c('100%','80%','60%','40%','20%'))
+scenario2_nid$threshold <- factor(scenario2_nid$threshold, levels = c('ConditionOnly', 'Condition&Age', 'Condition&Hazard', 'ConditionHazard&Age'))
+
+
+S2_nid <- ggplot(data=scenario2_nid, aes(x=threshold, y=(totcost.mean/1000000000), 
+                  ymin=(totcost.mean.min/1000000000), ymax=(totcost.mean.max/1000000000), 
+                  fill=prop.removed, alpha=0.9)) +
+  geom_bar(position=position_dodge(), alpha=0.65, stat="identity")+
+  geom_errorbar(width=.2, position=position_dodge(0.9))+
+  geom_text(aes(label = round(totdams)), vjust = -1.5, position=position_dodge(0.9), colour="black", size =2.5)+
+  scale_x_discrete(labels = c('Poor condition','Poor condition \n >= 50 years',
+                              'Poor condition \n & high hazard', 
+                              'Poor condition & high \n hazard >= 50 years'))+
+  xlab('')+ ylim(0,11) + scale_alpha(guide = 'none')+ 
+  ylab('Cost of Dam Removals \n (in Billions of 2020 USD)')+
+  scale_fill_manual(name = "Proportion removed",values=c("#1C1C1C", "deepskyblue4","darkslategrey", "lightseagreen", "darkseagreen"))+
+  theme_minimal()+ theme(legend.position="bottom"); S2_nid
+
+colnames(scenario2_nid)
+scenario2_nid_long <- melt(setDT(scenario2_nid), id.vars = c("threshold","prop.removed", "totdams"),variable.name = "CostType")
+scenario2_nid_long$prop.removed <- factor(scenario2_nid_long$prop.removed, levels = c('100%','80%','60%','40%','20%'))
+scenario2_nid_long$Type <- factor(scenario2_nid_long$CostType, levels = c('totcost.lci','totcost.mean','totcost.uci'))
+scenario2_nid_long$threshold <- factor(scenario2_nid_long$threshold, levels = c('ConditionOnly', 'Condition&Age', 'Condition&Hazard', 'ConditionHazard&Age'))
+
+colnames(scenario2_nid_long)
+S2_nid_WithPI <-ggplot(data=subset(scenario2_nid_long, 
+                                   scenario2_nid_long$Type %in% c('totcost.lci','totcost.mean','totcost.uci')), 
+       aes(x = prop.removed, y = (value/1000000000),
+               fill = Type))+
+  geom_bar(position="identity", alpha=0.4, stat="identity")+
+ #geom_errorbar(width=.2, color="gray18")+
+  facet_grid(~ threshold, switch = "x") +
+  theme(strip.placement = "outside",
+        strip.background = element_rect(fill = NA, color = "white"),
+        panel.spacing = unit(.1,"cm"))+
+  scale_fill_manual(name = "Cost",values=c("#1C1C1C", "deepskyblue4","darkslategrey"))+
+  geom_text(data=scenario2_nid_long[scenario2_nid_long$CostType %in% 'totcost.uci'], 
+            aes(label = round(totdams)),
+            hjust=0.5,vjust = -1.5,
+           position=position_dodge2(0.9), colour="black", size =2.5)+
+  ylim(0,30)+xlab('')+ ylab('Cost of Dam Removals \n (in Billions of 2020 USD)')+
+  theme_minimal()+ theme(legend.position="bottom")+
+  theme(axis.text.x = element_text(angle=90, vjust=.5, hjust=1)); S2_nid_WithPI
+
+```

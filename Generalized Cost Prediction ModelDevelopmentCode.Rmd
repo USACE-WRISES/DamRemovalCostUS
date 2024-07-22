@@ -1,0 +1,624 @@
+---
+title: "Global Cost Model Without the Complexity Score"
+author: "Suman Jumani"
+date: "2023-07-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, cache =TRUE)
+```
+
+
+## **Predicting Dam Removal Cost Without the Complexity Score**
+
+Here we attempt to build a gradient boosted model to predict dam removal costs without the complexity parameter used in the original dam cost predictor tool (Duda et al. 2023). To estimate or replace project complexity, we use several proxy metrics that may be directly or indirectly related to the cost drivers in the USGS dam data set. A total of 18 proxy variables were computed for each dam in the USGS database. Depending on the variable and its scale of influence, they were computed at the scale of the dam point location (buffers of 2.5km and 5km around the dam site) or the dam catchment area (the total upstream contributing area draining into each dam). More information can be found in Jumani et al.  
+
+**Methods:** We use Gradient boosted machines (GBMs) or boosted regression trees, a popular machine learning algorithm. Unlike random forests, where an ensemble of deep independent trees are built, GBMs build an ensemble of shallow and weak successive trees with each tree learning and improving on the previous. When combined, these many weak successive trees produce a powerful “committee”. The main idea of boosting is is that trees are grown sequentially using information from previously grown trees. At each iteration, a new weak, base-learner tree is fit to the residuals of the previous ensemble of trees, and the process continues till the cross validation makes it stop.Combining many weak models (versus strong ones) has three main benefits:       
+
+* Speed - Shorter trees are computationally cheaper
+* Accuracy improvement - weak models allow the algorithm to learn slowly, making minor adjustments in areas where it does not perform well, generally improving model performance 
+* Reduced overfitting - small incremental improvements with each model in the ensemble allows it to stop the learning process as soon as overfitting has been detected (typically by using cross-validation).  
+
+
+```{r eval=FALSE, echo=FALSE}
+#Load necessary packages
+library(tidyverse)
+library(gbm)
+library(caret)
+library(hrbrthemes)
+library(kableExtra)
+library(patchwork)
+library(skimr)
+library(tune)
+library(pdp)
+library(dplyr)
+library(ggcorrplot)
+library(ggplot2)
+library(patchwork)
+library(pscl)
+library(quantreg)
+library(tidyr)
+
+rm(list=ls(all=TRUE)) #Clear local memory
+```
+
+
+## **Data Preparation and Preprocessing**
+#### a. Data examination and pre-processing 
+
+```{r}
+library(dplyr)
+##Import the data (can be downloaded from Duda et al. 2023b)
+fin<-read.csv("CleanedDataFinalCopy.csv")
+dat_buffer<-read.csv("BufferParams_DataFinal.csv")
+dat_whsed<-read.csv("WshedParams_DataFinal.csv")
+
+#Add variable of dam age
+fin$Dam_age<- fin$Removal_year - fin$Built_year 
+
+#Convert stream order to numeric
+fin$StrOrder<- as.numeric(fin$StrOrder)
+
+#Re-scale SD, MD, PR, and Total scores between 0 and 1
+range01 <- function(x){(x-min(x))/(max(x)-min(x))}
+fin$SD_scale <- range01(fin$SD_score)
+fin$MD_scale <- range01(fin$MD_score)
+fin$PR_scale <- range01(fin$PR_score)
+fin$Tot_scale <- range01(fin$Tot_Drivers)
+fin$Tot_scale2 <- range01(fin$Tot_Drivers2)
+
+#Replacing missing ht data with the median dam ht for dams <5m 
+#Isolating missing height data for dams <5m high
+missingHt<-fin[(is.na(fin$dam_height_m)) & fin$HtCategory=="less than 5",] #35 missing observations
+missingHt$dam_height_m<- median(fin$dam_height_m[fin$HtCategory=="less than 5"], na.rm = TRUE)
+fin$dam_height_imp<- missingHt$dam_height_m[match(fin$feature_id, missingHt$feature_id)]
+fin$dam_height_m<- coalesce(fin$dam_height_m, fin$dam_height_imp)
+
+#Combining fin & dat
+damat<- left_join(fin,dat_buffer, by="feature_id")
+dam_attr<- left_join(damat,dat_whsed, by="feature_id")
+
+#Retaining a data frame of only predictors and the response variables
+dam_attr<- dam_attr[,-c(1,5:6,14,15,17,20:37,40:42,44:50,84,85)] 
+
+#Adding binary variables for the top five states with the most dam removals
+dam_attr<- dam_attr%>%
+  mutate(St_PA = if_else(state.x=="PA", 1, 0),
+         St_CA = if_else(state.x=="CA", 1, 0),
+         St_MI = if_else(state.x=="MI", 1, 0),
+         St_MA = if_else(state.x=="MA", 1, 0),
+         St_WI = if_else(state.x=="WI", 1, 0))
+
+```
+
+* **Region** is the only categorical variables we will use in the model.
+* **Dam length** & **Dam age** have too many missing values to impute, hence excluded from the model  
+
+
+#### b. Calculate LDI & other predictors
+
+```{r}
+dam_attr$LDI<- (((dam_attr$NLCDarea_m2_OpenWater/(dam_attr$WshedArea_km2*1000000))) * 1)+
+  (((dam_attr$NLCDarea_m2_Ice/(dam_attr$WshedArea_km2*1000000))) * 1)+
+  (((dam_attr$NLCDarea_m2_OpenSpace/(dam_attr$WshedArea_km2*1000000))) * 6.92)+
+  (((dam_attr$NLCDarea_m2_DevLI/(dam_attr$WshedArea_km2*1000000))) * 7.47)+
+  (((dam_attr$NLCDarea_m2_DevMI/(dam_attr$WshedArea_km2*1000000))) * 8)+
+  (((dam_attr$NLCDarea_m2_DevHI/(dam_attr$WshedArea_km2*1000000))) * 9.18)+
+  (((dam_attr$NLCDarea_m2_Barren/(dam_attr$WshedArea_km2*1000000))) * 1.83)+
+  (((dam_attr$NLCDarea_m2_Deciduous/(dam_attr$WshedArea_km2*1000000))) * 1)+
+  (((dam_attr$NLCDarea_m2_Evergreen/(dam_attr$WshedArea_km2*1000000))) * 1)+
+  (((dam_attr$NLCDarea_m2_MixedFor/(dam_attr$WshedArea_km2*1000000))) * 1)+
+  (((dam_attr$NLCDarea_m2_Scrub/(dam_attr$WshedArea_km2*1000000))) * 1)+
+  (((dam_attr$NLCDarea_m2_Grassland/(dam_attr$WshedArea_km2*1000000))) * 1)+
+  (((dam_attr$NLCDarea_m2_Pasture/(dam_attr$WshedArea_km2*1000000))) * 3.57)+
+  (((dam_attr$NLCDarea_m2_Wetlands/(dam_attr$WshedArea_km2*1000000))) * 1)+
+  (((dam_attr$NLCDarea_m2_herbWetland/(dam_attr$WshedArea_km2*1000000))) * 1)
+  
+dam_attr$DevHIpercent <- (dam_attr$NLCDarea_m2_DevHI/(dam_attr$WshedArea_km2*1000000))*100
+dam_attr$DevMIpercent <- (dam_attr$NLCDarea_m2_DevMI/(dam_attr$WshedArea_km2*1000000))*100
+dam_attr$DevHMIpercent <- dam_attr$DevHIpercent + dam_attr$DevMIpercent
+
+```
+
+#### c. Examining correlations between predictor variables.
+
+```{r eval=FALSE}
+library(ggcorrplot)
+dam_attr_num <- dplyr::select_if(dam_attr, is.numeric)
+dam_attr_num<- dam_attr_num[,-c(1,2,9)]
+dam_attr_num_red<- dam_attr_num[,-c(9:11,15:17,20:23,25,26,28,29,31,32,34,35,37,38,40,41,49:66,68,69:71,73)]
+  
+ne_cor <- cor(dam_attr_num_red, use="complete.obs")
+ggcorrplot(ne_cor, hc.order = TRUE,type = "lower")
+
+```
+
+
+
+Apart from the mean, median & modes of the same variables, We see the following highly correlated variable pairs:
+
+* Mine count & Mine area - **Use mine count** in the model
+* Historic Object & Historic site - **Use Historic Site**
+* RdCount & RdLth - **Use Rdcount**
+* Impervious_Mean, LDI, DevMIpercent, DevHMIpercent - **Use Impervious mean**  
+
+
+## **Working with the full data**
+
+### Step 1 - Partition & process the data 
+Split data to create training (80%) and test (20%) data using caret’s 'createDataPartition' function  
+
+```{r}
+set.seed(100) 
+trainRowNumbers <- caret::createDataPartition(dam_attr$CostEst_StAdj, p=0.8, list=FALSE)
+
+train <- dam_attr[trainRowNumbers,] #n=536
+test <- dam_attr[-trainRowNumbers,]
+
+#Adding the following dams to the test dataset to align with Duda et al. 2023
+#Hemlock, Sabin Dam, Boardman Dam, Gordon Dam, Grihm dam, Savage Rapids, Mill Pond (Mill river Stamford), Smelt Hill
+#Subsetting the above dams 
+select<- train[train$dam_name.x %in% c("Mill Pond Dam",  "Savage Rapids Dam"),]
+
+#Remove an equivalent number from test and add to train
+set.seed(111)
+temp<- sample_n(test, nrow(select))
+train<- train[! train$dam_name.x %in% select$dam_name.x,]
+train<- rbind(train, temp)
+
+#Remove temp from test and ddd select to test 
+test<- test[!test$dam_name.x %in% temp$dam_name.x, ]
+test<- rbind(test, select)
+
+test2 <- test; test2$Cat <- "test"
+train2<-train; train2$Cat<- "train"
+df<- rbind(train2, test2)
+ggplot(df,aes(x = log1p(dam_height_m), y = CostEst_StAdj, color = Cat)) + geom_point() +
+  scale_color_discrete(name="") + theme(legend.position="top")
+
+```
+
+The distribution of training and testing data points look okay.
+
+
+### Step 2 - One hot encoding catgorical variables
+Converting the categorical variable of 'Region' to dummy variables (one-hot encoding) - Categorical columns need to be converted to numeric in order for it to be used by the machine learning algorithms. Just replacing the categories with a number may not be meaningful especially if there is no intrinsic ordering among the categories. So we convert the categorical variable with as many binary (1 or 0) variables as there are categories  
+
+```{r}
+library(caret)
+
+#Creating dummy variables is converting a categorical variable to as many binary variables as there are categories
+dummies_model <- caret::dummyVars(CostEst_StAdj ~ . - state.x - feature_id -DamPurpose -Tot_scale
+                                  -NLCDarea_m2_OpenWater -NLCDarea_m2_Ice -NLCDarea_m2_OpenSpace
+                                  -NLCDarea_m2_Barren -NLCDarea_m2_Deciduous -NLCDarea_m2_Evergreen
+                                  -NLCDarea_m2_MixedFor -NLCDarea_m2_Scrub -NLCDarea_m2_Grassland 
+                                  -NLCDarea_m2_Pasture -NLCDarea_m2_Crop -NLCDarea_m2_herbWetland
+                                  -NLCDarea_m2_Wetlands -dam_name.x -dam_name.y, data=train)
+                                    
+#Create the dummy variables using predict. The Y variable (CostEst_StAdj) will not be present in trainData_mat.
+trainData_mat <- predict(dummies_model, newdata = train)
+
+#Convert to dataframe
+trainr <- as.data.frame(trainData_mat)
+
+# Append the Y variable
+trainr$CostEst_StAdj<- train$CostEst_StAdj
+
+```
+
+
+### Step 3 - Visualize the importance of variables
+Also using this output to examine which buffer distances to user for each variable.based on visualized trends, use the following   
+* City count, Pop density - try 2.5km and 5km
+* Exclude total population
+* Road count & length - try 2.5km and 5km
+* Bridge count - 2.5km
+* Historic district - 2.5km
+* Historic building - try 2.5km and 5km
+
+```{r warning=FALSE, fig.width=9,fig.height=17}
+library(caret)
+featurePlot(x = trainr[, c(1:10,12,13,22,19,24,21,25:28,31,46,34,35,48:52,59,60,65,69:73)], 
+            y = log1p(trainr$CostEst_StAdj), 
+            plot = "scatter", 
+            type = c("p", "smooth"), 
+            span = 1, layout = c(5, 8))
+```
+
+**Summary:** Of all the proxy variables considered,population density, bridge & road counts, historic buildings & districts, TRI and Superfund counts, and latitude seem to show some trend with dam removal costs. 
+
+### Step 4 - Training and Tuning the model
+
+```{r}
+#Are there any variables with near-zero variance? If so, they may need to be dropped
+set.seed(100)
+nv <- nearZeroVar(trainr, saveMetrics= TRUE) 
+rownames(filter(nv, nzv == "TRUE")) #14 variables with zero variance -do not use these variables in the model
+
+#Initial parameterization and tuning (key inputs: iterations, tree size, shrinkage) 
+#Using a k-fold cross-validation that resamples and splits our data many times to avoid overfitting
+fitControl <- trainControl(method = "repeatedcv", #repeated K-fold cross-validation 
+                           number = 10, #10-fold cross-validations (each fold will have ~66 data points)
+                           repeats = 10, #Ten separate 10-fold cross-validations used
+                           allowParallel = TRUE)
+```
+
+After preliminary checks, we build a model based on the following -
+
+* We exclude dam age and dam length to reduce the need for missing data imputation & increase sample size for model prediction    
+* We use proxy variables that are not highly correlated and do not have a near zero variance in place of the complexity score   
+* We build two versions of the model - one with latitude and one without latitude, but with the presence of the top five states as binary variables
+
+Let's incorporate these changes and **tune our hyper parameters**.
+To tune a boosted tree model, we can give the model different values of the tuning parameters. Caret will re-train the model using different tuning parameters and select the best version. There are three main tuning parameters to consider:
+
+* Number of iterations or trees, called **n.trees** (should be very high)
+* Complexity of the tree, called **interaction.depth** (should be low-medium)
+* Learning rate: how quickly the algorithm adapts, called **shrinkage** (should be low)
+* Minimum number of observations in a node to commence splitting, called **n.minobsinnode** (10-20)
+
+```{r eval=FALSE}
+tuneGrid2 <- expand.grid(
+  n.trees = seq(1700, 2800, 100),
+  interaction.depth = c(2, 3, 4),
+  shrinkage = c(0.0045,0.005,0.0055),
+  n.minobsinnode = 10
+ )
+
+library("doParallel") #Run on parallel cores to improve speed
+detectCores() #we have 20 cores
+cl<-makePSOCKcluster(6) #run on 6
+registerDoParallel(cl)
+
+set.seed(111)
+gbm3a <- train(log1p(CostEst_StAdj) ~dam_height_m+ DamMaterialCat+
+              AvgAnnualQ.CS+ TotDA.SqKm+ St_PA+St_CA+St_MI+St_MA+St_WI+
+              region.xNorthwest+ region.xNortheast+ region.xSouthwest +
+              Impervious_MEAN+ SoilErodability_MEAN +
+              TRICount + SuperfundArea_m2+
+              HistoricBuilding_5km+
+              BridgeCount_2.5km+ RdCount_2.5km+
+              Population_5km,
+              data=trainr,
+              method = "gbm",                        #ML method
+              metric = "RMSE",                      #Choose a fit metric
+              maximize =FALSE,
+              #preProcess = c("center", "scale"),
+              trControl = fitControl,               #CV settings
+              tuneGrid = tuneGrid2,                  #Tuning parameters
+              verbose = FALSE,
+              bag.fraction=0.7,                   #prevents over-fitting
+              na.action=na.exclude)
+gbm3a #Best model R2=58.26%, RMSE=1.27, MAE=0.987 (shrinkage=0.005, int depth=4, ntree=2000)
+
+set.seed(111)
+gbm3b <- train(log1p(CostEst_StAdj) ~dam_height_m+ DamMaterialCat+
+              AvgAnnualQ.CS+ TotDA.SqKm+ St_PA+St_CA+St_WI+
+              Impervious_MEAN+ SoilErodability_MEAN +
+              TRICount + SuperfundArea_m2+
+              HistoricBuilding_5km+
+              BridgeCount_2.5km+ RdCount_2.5km+
+              Population_5km,
+              data=trainr,
+              method = "gbm",                        #ML method
+              metric = "RMSE",                      #Choose a fit metric
+              maximize =FALSE,
+              #preProcess = c("center", "scale"),
+              trControl = fitControl,               #CV settings
+              tuneGrid = tuneGrid2,                  #Tuning parameters
+              verbose = FALSE,
+              bag.fraction=0.7,                   #prevents over-fitting
+              na.action=na.exclude)
+gbm3b #Best model R2=58.14%, RMSE=1.27, MAE=0.989 (shrinkage=0.005, int depth=4, ntree=2000)
+
+stopCluster(cl) #end parallel processing
+
+```
+
+```{r}
+library(caret)
+library(gbm)
+
+varImp(object=gbm3a)
+plot(varImp(object=gbm3a),main="GBM 3A - Variable Importance")
+
+varImp(object=gbm3b)
+plot(varImp(object=gbm3b),main="GBM 3B - Variable Importance")
+
+```
+
+* I tried several models, and calibrated and adjusted the tuning parameters to get the best model and fit 
+* The above computes (16x3x4) 192 combinations 
+* The final values used for the model were n.trees = 2000, interaction.depth = 4, shrinkage = 0.005, n.minobsinnode = 10. The model **R2 = 58.1%, RMSE = 1.27, MAE = 0.98** 
+* Dam height, discharge, road count, drainage area, impervious area, PA state, and TRI count are the most important drivers of cost.
+
+### Step 5 - Predict on test data
+
+Now, let's examine model performance on the test data using the predict function. We need to first separate the test predictor variables and test response (or cost). RMSE, RAE, and R2 will be the metrics to evaluate model fit. In order to use the model to predict on new data, the data has to be pre-processed and transformed the way we did on the training data. 
+
+```{r}
+#Create dummy variables
+test2 <- predict(dummies_model, test)
+
+#Exponentiating the results to revert the log transformation
+gbm3a_pred = exp(predict(gbm3a, test2))-1
+gbm3b_pred = exp(predict(gbm3b, test2))-1
+
+#Assigning test data row names to the predictions
+names(gbm3a_pred)<- test$dam_name[complete.cases(test[,c(4,5,8,9,12:13,22,27,33,37,52,53,76,81)])]
+names(gbm3b_pred)<- test$dam_name[complete.cases(test[,c(4,5,8,9,12:13,22,27,33,37,52,53,76,81)])]
+
+## Evaluate model accuracy 
+residualsa<-test$CostEst_StAdj[complete.cases(test[,c(4,5,8,9,12:13,22,27,33,37,52,53,76,81)])]- gbm3a_pred
+residualsb<-test$CostEst_StAdj[complete.cases(test[,c(4,5,8,9,12:13,22,27,33,37,52,53,76,81)])]- gbm3b_pred
+
+#RMSE
+RMSE.gbm3a<- sqrt(mean(residualsa^2)); RMSE.gbm3a #4.42M 
+RMSE.gbm3b<- sqrt(mean(residualsb^2)); RMSE.gbm3b #4.59M 
+
+#MAE
+MAE.gbm3a<- mean(abs(residualsa)); MAE.gbm3a #1.42M 
+MAE.gbm3b<- mean(abs(residualsb)); MAE.gbm3b #1.45M 
+
+#R2
+meanCost<-mean(test$CostEst_StAdj[complete.cases(test[,c(4,5,8,9,12:13,22,27,33,37,52,53,76,81)])])
+tss<- sum((test$CostEst_StAdj[complete.cases(test[,c(4,5,8,9,12:13,22,27,33,37,52,53,76,81)])]-meanCost)^2) #tot sum of squares
+rssa<- sum(residualsa^2); rsqa<- 1-(rssa/tss); rsqa #50.5%
+rssb<- sum(residualsb^2); rsqb<- 1-(rssb/tss); rsqb #46.5%
+```
+
+
+### Step 6 - Generating Prediction Intervals for GBMs
+In order to estimate some uncertainty around predicted costs, lets use GBMs with a quantile distribution to estimate cost at different quantiles. Let's compute cost estimates for 97.5, 75, 50, 25, 2.5 quantiles for GBM 3a (the better of the two).
+
+```{r}
+#For GBM3A
+ tuneGrid2a <- expand.grid(
+  n.trees = 3000, #increasing no of trees to improve robustness
+  interaction.depth = 4, #since that's the best option based on above constructed GBMs
+  shrinkage = 0.005, #a low learning rate for robustness
+  n.minobsinnode = 10
+ )
+
+library("doParallel") #Run on parallel cores to improve speed
+detectCores() #we have 20 cores
+cl<-makePSOCKcluster(6) #run on 6
+registerDoParallel(cl)
+library(gbm)
+
+set.seed(111)
+gbm3a_mean <- train(log1p(CostEst_StAdj) ~dam_height_m+ DamMaterialCat+
+               AvgAnnualQ.CS+ TotDA.SqKm+ St_PA+St_CA+St_MI+St_MA+St_WI+
+               region.xNorthwest+ region.xNortheast+ region.xSouthwest +
+               Impervious_MEAN+ SoilErodability_MEAN +
+               TRICount + SuperfundArea_m2+
+               HistoricBuilding_5km+
+               BridgeCount_2.5km+ RdCount_2.5km+
+               Population_5km,
+               data=trainr,
+               method = "gbm",                        #ML method
+               metric = "RMSE",                      #Choose a fit metric
+               maximize =FALSE,
+               #preProcess = c("center", "scale"),
+               trControl = fitControl,               #CV settings
+               tuneGrid = tuneGrid2a,                  #Tuning parameters
+               verbose = FALSE,
+               bag.fraction=0.7,                   #prevents over-fitting
+               na.action=na.exclude)
+
+set.seed(111)
+gbm3a_0.5 <- train(log1p(CostEst_StAdj) ~ dam_height_m+ DamMaterialCat+
+                    AvgAnnualQ.CS+ TotDA.SqKm+ St_PA+St_CA+St_MI+St_MA+St_WI+
+                    region.xNorthwest+ region.xNortheast+ region.xSouthwest +
+                    Impervious_MEAN+ SoilErodability_MEAN +
+                    TRICount + SuperfundArea_m2+
+                    HistoricBuilding_5km+
+                    BridgeCount_2.5km+ RdCount_2.5km+
+                    Population_5km,
+                    data=trainr,              #Run on the training data
+                    distribution = list(name="quantile",alpha=0.5),
+                    method = "gbm",
+                    metric = "RMSE",
+                    maximize =FALSE,
+                    trControl = fitControl,
+                    tuneGrid = tuneGrid2a,
+                    verbose = FALSE,
+                    bag.fraction=0.7,
+                    na.action=na.exclude)
+
+set.seed(111)
+gbm3a_0.75 <- train(log1p(CostEst_StAdj) ~ dam_height_m+ DamMaterialCat+
+                    AvgAnnualQ.CS+ TotDA.SqKm+ St_PA+St_CA+St_MI+St_MA+St_WI+
+                    region.xNorthwest+ region.xNortheast+ region.xSouthwest +
+                    Impervious_MEAN+ SoilErodability_MEAN +
+                    TRICount + SuperfundArea_m2+
+                    HistoricBuilding_5km+
+                    BridgeCount_2.5km+ RdCount_2.5km+
+                    Population_5km,
+                    data=trainr,              #Run on the training data
+                    distribution = list(name="quantile",alpha=0.75),
+                    method = "gbm",
+                    metric = "RMSE",
+                    maximize =FALSE,
+                    trControl = fitControl,
+                    tuneGrid = tuneGrid2a,
+                    verbose = FALSE,
+                    bag.fraction=0.7,
+                    na.action=na.exclude)
+
+
+set.seed(111)
+gbm3a_0.25 <- train(log1p(CostEst_StAdj) ~ dam_height_m+ DamMaterialCat+
+                    AvgAnnualQ.CS+ TotDA.SqKm+ St_PA+St_CA+St_MI+St_MA+St_WI+
+                    region.xNorthwest+ region.xNortheast+ region.xSouthwest +
+                    Impervious_MEAN+ SoilErodability_MEAN +
+                    TRICount + SuperfundArea_m2+
+                    HistoricBuilding_5km+
+                    BridgeCount_2.5km+ RdCount_2.5km+
+                    Population_5km,
+                    data=trainr,              #Run on the training data
+                    distribution = list(name="quantile",alpha=0.25),
+                    method = "gbm",
+                    metric = "RMSE",
+                    maximize =FALSE,
+                    trControl = fitControl,
+                    tuneGrid = tuneGrid2a,
+                    verbose = FALSE,
+                    bag.fraction=0.7,
+                    na.action=na.exclude)
+
+set.seed(111)
+gbm3a_0.975 <- train(log1p(CostEst_StAdj) ~ dam_height_m+ DamMaterialCat+
+                    AvgAnnualQ.CS+ TotDA.SqKm+ St_PA+St_CA+St_MI+St_MA+St_WI+
+                    region.xNorthwest+ region.xNortheast+ region.xSouthwest +
+                    Impervious_MEAN+ SoilErodability_MEAN +
+                    TRICount + SuperfundArea_m2+
+                    HistoricBuilding_5km+
+                    BridgeCount_2.5km+ RdCount_2.5km+
+                    Population_5km,
+                    data=trainr,              #Run on the training data
+                    distribution = list(name="quantile",alpha=0.975),
+                    method = "gbm",
+                    metric = "RMSE",
+                    maximize =FALSE,
+                    trControl = fitControl,
+                    tuneGrid = tuneGrid2a,
+                    verbose = FALSE,
+                    bag.fraction=0.7,
+                    na.action=na.exclude)
+
+
+set.seed(111)
+gbm3a_0.025 <- train(log1p(CostEst_StAdj) ~ dam_height_m+ DamMaterialCat+
+                    AvgAnnualQ.CS+ TotDA.SqKm+ St_PA+St_CA+St_MI+St_MA+St_WI+
+                    region.xNorthwest+ region.xNortheast+ region.xSouthwest +
+                    Impervious_MEAN+ SoilErodability_MEAN +
+                    TRICount + SuperfundArea_m2+
+                    HistoricBuilding_5km+
+                    BridgeCount_2.5km+ RdCount_2.5km+
+                    Population_5km,
+                    data=trainr,              #Run on the training data
+                    distribution = list(name="quantile",alpha=0.025),
+                    method = "gbm",
+                    metric = "RMSE",
+                    maximize =FALSE,
+                    trControl = fitControl,
+                    tuneGrid = tuneGrid2a,
+                    verbose = FALSE,
+                    bag.fraction=0.7,
+                    na.action=na.exclude)
+
+stopCluster(cl) #end parallel processing
+
+# Predictions
+test2 <- predict(dummies_model, test)
+
+#Exponentiating the results to revert the log transformation
+gbm3a_meanpred = exp(predict(gbm3a_mean, test2))-1
+gbm3a_0.50pred = exp(predict(gbm3a_0.5, test2))-1
+gbm3a_0.75pred = exp(predict(gbm3a_0.75, test2))-1
+gbm3a_0.25pred = exp(predict(gbm3a_0.25, test2))-1
+gbm3a_0.975pred = exp(predict(gbm3a_0.975, test2))-1
+gbm3a_0.025pred = exp(predict(gbm3a_0.025, test2))-1
+
+#Assigning test data row names to the predictions
+names(gbm3a_meanpred)<- test$dam_name[complete.cases(test[,c(4,5,8,9,12:13,22,27,33,37,52,53,76,81)])]
+names(gbm3a_0.50pred)<- test$dam_name[complete.cases(test[,c(4,5,8,9,12:13,22,27,33,37,52,53,76,81)])]
+names(gbm3a_0.75pred)<- test$dam_name[complete.cases(test[,c(4,5,8,9,12:13,22,27,33,37,52,53,76,81)])]
+names(gbm3a_0.25pred)<- test$dam_name[complete.cases(test[,c(4,5,8,9,12:13,22,27,33,37,52,53,76,81)])]
+names(gbm3a_0.975pred)<-test$dam_name[complete.cases(test[,c(4,5,8,9,12:13,22,27,33,37,52,53,76,81)])]
+names(gbm3a_0.025pred)<-test$dam_name[complete.cases(test[,c(4,5,8,9,12:13,22,27,33,37,52,53,76,81)])]
+
+#Compiling the predicted outputs
+compa <- data.frame(DamName= test$dam_name.x[complete.cases(test[,c(4,5,8,9,12:13,22,27,33,37,52,53,76,81)])],
+                   Actual = test$CostEst_StAdj[complete.cases(test[,c(4,5,8,9,12:13,22,27,33,37,52,53,76,81)])], 
+                   PredictedMeanA = gbm3a_meanpred,
+                   PredictedMedianA=gbm3a_0.50pred,
+                   PredictedA_0.75 = gbm3a_0.75pred,
+                   PredictedA_0.25 = gbm3a_0.25pred,
+                   PredictedA_0.975 = gbm3a_0.975pred,
+                   PredictedA_0.025 = gbm3a_0.025pred)
+compa$DamHt<- test$dam_height_m[match(compa$DamName, test$dam_name.x)]
+
+## Evaluate model accuracy 
+med_residualsA<-test$CostEst_StAdj[complete.cases(test[,c(4,5,8,9,12:13,22,27,33,37,52,53,76,81)])]- gbm3a_0.50pred
+mean_residualsA<-test$CostEst_StAdj[complete.cases(test[,c(4,5,8,9,12:13,22,27,33,37,52,53,76,81)])]- gbm3a_meanpred
+
+#RMSE
+RMSE.gbm3a_0.5<- sqrt(mean(med_residualsA^2)); RMSE.gbm3a_0.5 #5.09M
+RMSE.gbm3a_mean<- sqrt(mean(mean_residualsA^2)); RMSE.gbm3a_mean #4.38M
+
+#MAE
+MAE.gbm3a_0.5<- mean(abs(med_residualsA)); MAE.gbm3a_0.5 #1.53M 
+MAE.gbm3a_mean<- mean(abs(mean_residualsA)); MAE.gbm3a_mean #1.44M 
+
+#R2
+meanCost<-mean(test$CostEst_StAdj[complete.cases(test[,c(4,5,8,9,12:13,22,27,33,37,52,53,76,81)])])
+tss<- sum((test$CostEst_StAdj[complete.cases(test[,c(4,5,8,9,12:13,22,27,33,37,52,53,76,81)])]-meanCost)^2)#total sum of squares
+rss_MedA<- sum(med_residualsA^2); rsq_0.5A<- 1-(rss_MedA/tss); rsq_0.5A #34.2%
+rss_MeanA<- sum(mean_residualsA^2);rsq_meanA<- 1-(rss_MeanA/tss); rsq_meanA #51.2%
+
+```
+
+
+#### **WITHOUT LATITUDE:**
+The final 'best' median model predictions on the test data have an **RMSE of 5.09 million USD**, **MAE of 1.53 million USD**, and an **R2 of 34.2%**   
+The final 'best' mean model predictions on the test data have an **RMSE of 4.38 million USD**, **MAE of 1.44 million USD**, and an **R2 of 51.2%**
+
+
+### Step 7 - Examining Partial Dependence Plots
+
+Now that the primary drivers of removal costs have been identified, let's examine their **partial dependence plots (PDPs)**. PDPs plot the change in the average predicted value of the response as specified predictor feature(s) vary over their marginal distribution. For example, a PDP of cost and dam height will display the average change in predicted removal cost as we vary dam height while holding all other variables constant. This is done by holding all variables constant for each observation in our training data set but then apply the unique values of dam height for each observation. We then average the predicted cost across all the observations. Consequently, PDPs are low-dimensional graphical renderings of the prediction function so that the relationship between the outcome and predictors of interest can be more easily understood. These plots are especially useful in SGB and other black-box models since the output is not easily visualized (unlike a decision tree). 
+
+
+```{r echo=FALSE}
+library(pdp)
+library(gridExtra)
+
+grid.arrange(
+  partial(gbm3a_mean, pred.var = "dam_height_m", plot = TRUE, rug = TRUE),
+  partial(gbm3a_mean, pred.var = "AvgAnnualQ.CS", plot = TRUE, rug = TRUE),
+  partial(gbm3a_mean, pred.var = "RdCount_2.5km", plot = TRUE, rug = TRUE),
+  partial(gbm3a_mean, pred.var = "Impervious_MEAN", plot = TRUE, rug = TRUE),
+  partial(gbm3a_mean, pred.var = "TotDA.SqKm", plot = TRUE, rug = TRUE),
+  partial(gbm3a_mean, pred.var = "St_PA", plot = TRUE, rug = TRUE),
+  partial(gbm3a_mean, pred.var = "TRICount", plot = TRUE, rug = TRUE),
+  partial(gbm3_mean, pred.var = "SoilErodability_MEAN", plot = TRUE, rug = TRUE),
+  partial(gbm3a_mean, pred.var = "Population_5km", plot = TRUE, rug = TRUE),
+  partial(gbm3a_mean, pred.var = "St_CA", plot = TRUE, rug = TRUE),
+  partial(gbm3a_mean, pred.var = "HistoricBuilding_5km", plot = TRUE, rug = TRUE),
+  partial(gbm3a_mean, pred.var = "BridgeCount_2.5km", plot = TRUE, rug = TRUE),
+  partial(gbm3a_mean, pred.var = "St_WI", plot = TRUE, rug = TRUE),
+  partial(gbm3a_mean, pred.var = "DamMaterialCat", plot = TRUE, rug = TRUE),
+  partial(gbm3a_mean, pred.var = "region.xNorthwest", plot = TRUE, rug = TRUE),
+  partial(gbm3a_mean, pred.var = "SuperfundArea_m2", plot = TRUE, rug = TRUE),
+  partial(gbm3a_mean, pred.var = "St_MI", plot = TRUE, rug = TRUE),
+  partial(gbm3a_mean, pred.var = "St_MA", plot = TRUE, rug = TRUE),
+  partial(gbm3a_mean, pred.var = "region.xNortheast", plot = TRUE, rug = TRUE),
+  partial(gbm3a_mean, pred.var = "region.xSouthwest", plot = TRUE, rug = TRUE),
+  ncol = 4
+)
+
+
+```
+
+
+### Step 8 - Visualizing the predictions on the test data
+
+```{r echo=FALSE, fig.width=10,fig.height=7}
+colnames(compa)
+library(ggrepel)
+
+ggplot(compa, aes(x=log1p(Actual), y=log1p(PredictedMeanA), 
+                  color = ifelse( Actual > PredictedMeanA, "Underestimate", "Overestimate"))) + 
+  geom_errorbar(aes(ymin=log1p(PredictedA_0.25), ymax=log1p(PredictedA_0.75)), lwd=1.1,
+                color="darkgrey",position=position_dodge(0.05))+
+  geom_errorbar(aes(ymin=log1p(PredictedA_0.025), ymax=log1p(PredictedA_0.975)), lwd=.5,
+                color="darkgrey",position=position_dodge(0.05))+
+  scale_color_manual(name="", values = c("coral3","aquamarine4"))+
+  geom_abline(intercept = 0, slope = 1, linetype = 2) +
+  geom_point(size=2, alpha=0.7)+xlab("Log Actual Cost")+ ylab("Log Predicted Cost")+
+  tune::coord_obs_pred()
+
+```
